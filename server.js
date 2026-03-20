@@ -46,19 +46,31 @@ await fastify.register(multipart, {
 });
 
 // Serve static files for frontend (if built)
-await fastify.register(staticFiles, {
-  root: path.join(__dirname, 'frontend', 'dist'),
-  prefix: '/',
-  wildcard: false,
-});
+const distPath = path.join(__dirname, 'frontend', 'dist');
+try {
+  await fs.access(distPath);
+  await fastify.register(staticFiles, {
+    root: distPath,
+    prefix: '/',
+    wildcard: false,
+  });
 
-// SPA fallback: serve index.html for non-API routes
-fastify.setNotFoundHandler(async (request, reply) => {
-  if (request.url.startsWith('/api')) {
-    return reply.code(404).send({ error: 'Route not found' });
-  }
-  return reply.sendFile('index.html');
-});
+  // SPA fallback: serve index.html for non-API routes
+  fastify.setNotFoundHandler(async (request, reply) => {
+    if (request.url.startsWith('/api')) {
+      return reply.code(404).send({ error: 'Route not found' });
+    }
+    return reply.sendFile('index.html');
+  });
+} catch {
+  console.log('⚠️  frontend/dist not found — run "npm run build" to generate it');
+  fastify.setNotFoundHandler(async (request, reply) => {
+    if (request.url.startsWith('/api')) {
+      return reply.code(404).send({ error: 'Route not found' });
+    }
+    return reply.code(404).send({ error: 'Frontend not built. Run npm run build.' });
+  });
+}
 
 // Create uploads directory
 const uploadsDir = path.join(__dirname, 'uploads');
