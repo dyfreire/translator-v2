@@ -59,6 +59,13 @@ try {
   console.log('Uploads directory exists or created');
 }
 
+// Helper: create a Supabase client authenticated with the user's JWT
+function createUserClient(token) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: `Bearer ${token}` } }
+  });
+}
+
 // Auth middleware
 async function authMiddleware(request, reply) {
   const authHeader = request.headers.authorization;
@@ -74,6 +81,8 @@ async function authMiddleware(request, reply) {
       return reply.code(401).send({ error: 'Invalid token' });
     }
     request.user = user;
+    request.userToken = token;
+    request.supabase = createUserClient(token);
   } catch (error) {
     return reply.code(401).send({ error: 'Auth failed' });
   }
@@ -173,7 +182,7 @@ fastify.post('/api/documents/upload', {
     }
 
     // Save to database - NO TEXT PROCESSING ON SERVER
-    const { error: dbError } = await supabase.from('documents').insert({
+    const { error: dbError } = await request.supabase.from('documents').insert({
       id: documentId,
       user_id: request.user.id,
       filename: data.filename,
@@ -210,7 +219,7 @@ fastify.get('/api/documents', {
   preHandler: authMiddleware 
 }, async (request, reply) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await request.supabase
       .from('documents')
       .select('*')
       .eq('user_id', request.user.id)
@@ -232,7 +241,7 @@ fastify.get('/api/documents/:id', {
   try {
     const { id } = request.params;
 
-    const { data, error } = await supabase
+    const { data, error } = await request.supabase
       .from('documents')
       .select('*')
       .eq('id', id)
@@ -256,7 +265,7 @@ fastify.put('/api/documents/:id/segments', {
     const { id } = request.params;
     const { segments } = request.body;
 
-    const { error } = await supabase
+    const { error } = await request.supabase
       .from('documents')
       .update({
         segments,
@@ -294,12 +303,12 @@ fastify.get('/api/files/:filename', async (request, reply) => {
   }
 });
 
-// Translation endpoint
-fastify.post('/api/translate', { 
-  preHandler: authMiddleware 
+// Document analysis endpoint - identifies document type for better translation context
+fastify.post('/api/analyze-document', {
+  preHandler: authMiddleware
 }, async (request, reply) => {
   try {
-    const { text, sourceLanguage, targetLanguage } = request.body;
+    const { text, sourceLanguage } = request.body;
 
     const response = await fetch('https://routellm.abacus.ai/v1/chat/completions', {
       method: 'POST',
@@ -308,11 +317,81 @@ fastify.post('/api/translate', {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'openai/gpt-4o-mini',
         messages: [
           {
             role: 'system',
-            content: `You are a professional translator. Translate the given text from ${sourceLanguage} to ${targetLanguage}. Return only the translated text, nothing else.`
+            content: `You are a document analyst specialized in legal and immigration documents. Analyze the text and respond ONLY with a JSON object (no markdown, no explanation) in this exact format:
+{"documentType": "<type>", "context": "<brief context>", "terminology": "<key terms guidance>"}
+
+Document types: birth_certificate, death_certificate, marriage_certificate, criminal_record, school_document, university_diploma, power_of_attorney, deed, immigration_form, support_letter, medical_record, financial_document, identity_document, other
+
+The "context" should describe what the document is about in one sentence.
+The "terminology" should list key domain-specific terms and how they should be translated accurately.`
+          },
+          {
+            role: 'user',
+            content: `Analyze this ${sourceLanguage} document:\n\n${text.substring(0, 3000)}`
+          }
+        ],
+        temperature: 0.1
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Analysis API error: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices[0].message.content.trim();
+
+    // Parse JSON response, handle possible markdown wrapping
+    let analysis;
+    try {
+      const jsonStr = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      analysis = JSON.parse(jsonStr);
+    } catch {
+      analysis = { documentType: 'other', context: content, terminology: '' };
+    }
+
+    return analysis;
+  } catch (error) {
+    fastify.log.error(error);
+    return reply.code(500).send({ error: error.message });
+  }
+});
+
+// Translation endpoint
+fastify.post('/api/translate', { 
+  preHandler: authMiddleware 
+}, async (request, reply) => {
+  try {
+    const { text, sourceLanguage, targetLanguage, documentContext } = request.body;
+
+    // Build system prompt with document context if available
+    let systemPrompt = `You are a professional legal document translator specializing in immigration documents. Translate the given text from ${sourceLanguage} to ${targetLanguage}. Return ONLY the translated text, nothing else.`;
+
+    if (documentContext) {
+      systemPrompt += `\n\nDocument type: ${documentContext.documentType || 'unknown'}.`;
+      if (documentContext.context) {
+        systemPrompt += ` Context: ${documentContext.context}.`;
+      }
+      if (documentContext.terminology) {
+        systemPrompt += ` Key terminology guidance: ${documentContext.terminology}.`;
+      }
+      systemPrompt += `\nUse appropriate legal and domain-specific terminology for this document type. Maintain formal register.`;
+    }
+
+    const response = await fetch('https://routellm.abacus.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${ROUTELLM_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: 'system',
+            content: systemPrompt
           },
           {
             role: 'user',
