@@ -47,8 +47,17 @@ await fastify.register(multipart, {
 
 // Serve static files for frontend (if built)
 await fastify.register(staticFiles, {
-  root: path.join(__dirname, 'dist'),
-  prefix: '/'
+  root: path.join(__dirname, 'frontend', 'dist'),
+  prefix: '/',
+  wildcard: false,
+});
+
+// SPA fallback: serve index.html for non-API routes
+fastify.setNotFoundHandler(async (request, reply) => {
+  if (request.url.startsWith('/api')) {
+    return reply.code(404).send({ error: 'Route not found' });
+  }
+  return reply.sendFile('index.html');
 });
 
 // Create uploads directory
